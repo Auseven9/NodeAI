@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base theme: framework Material NoActionBar so it resolves without the
+         Material Components XML library. Compose supplies the real app colors. -->
+    <style name="Theme.NodeAI" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
