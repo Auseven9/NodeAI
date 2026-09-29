@@ -2,6 +2,7 @@ package com.auseven.nodeai
 
 import android.app.Application
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import android.util.Log
 import androidx.compose.runtime.getValue
@@ -17,8 +18,7 @@ import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
-import java.io.File
-import java.io.FileOutputStream
+import kotlinx.coroutines.withContext
 
 enum class Role { USER, ASSISTANT }
 
@@ -30,6 +30,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private var modelPtr = 0L
     private var ctxPtr = 0L
+    // Kept open for the model's lifetime: llama.cpp memory-maps the file
+    // through /proc/self/fd, so the descriptor must stay valid until unload.
+    private var modelPfd: ParcelFileDescriptor? = null
 
     val messages = mutableStateListOf<ChatMessage>()
 
@@ -48,21 +51,34 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (busy) return
         busy = true
         modelReady = false
-        status = "Copying model to app storage…"
+        status = "Opening model…"
         viewModelScope.launch(Dispatchers.IO) {
-            val file = copyUriToFile(uri)
-            if (file == null) {
-                setStatus("Could not read the selected file.")
+            val name = queryDisplayName(uri) ?: "model.gguf"
+
+            // Open the model as a file descriptor instead of copying gigabytes
+            // into app storage. llama.cpp mmaps it in place via /proc/self/fd.
+            val pfd = try {
+                getApplication<Application>().contentResolver.openFileDescriptor(uri, "r")
+            } catch (e: Exception) {
+                Log.e(TAG, "openFileDescriptor failed", e)
+                null
+            }
+            if (pfd == null) {
+                setStatus("Could not open “$name”. Make sure it is on local storage.")
                 setBusy(false)
                 return@launch
             }
-            setStatus("Loading ${file.name}…")
 
+            // Release any previously loaded model (and its descriptor) first.
             freeNative()
+            modelPfd = pfd
 
-            val m = bridge.loadModel(file.absolutePath)
+            setStatus("Loading $name… (this can take a moment)")
+            val path = "/proc/self/fd/${pfd.fd}"
+            val m = bridge.loadModel(path)
             if (m == 0L) {
-                setStatus("Failed to load model. Is it a valid .gguf file?")
+                closePfd()
+                setStatus("Failed to load “$name”. Is it a valid .gguf model?")
                 setBusy(false)
                 return@launch
             }
@@ -70,15 +86,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val c = bridge.newContext(m, N_CTX, threads)
             if (c == 0L) {
                 bridge.freeModel(m)
-                setStatus("Failed to create the inference context.")
+                closePfd()
+                setStatus("Failed to create the inference context (out of memory?).")
                 setBusy(false)
                 return@launch
             }
             modelPtr = m
             ctxPtr = c
-            viewModelScope.launch(Dispatchers.Main) {
+            withContext(Dispatchers.Main) {
                 modelReady = true
-                status = "Ready · ${file.name}"
+                status = "Ready · $name"
                 busy = false
             }
         }
@@ -154,59 +171,36 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         return sb.toString()
     }
 
-    private fun copyUriToFile(uri: Uri): File? {
-        val ctx = getApplication<Application>()
-        val resolver = ctx.contentResolver
-        val name = queryDisplayName(uri) ?: "model.gguf"
-        val size = querySize(uri)
-        val dir = File(ctx.getExternalFilesDir(null), "models").apply { mkdirs() }
-        val out = File(dir, name)
-
-        // Reuse a previously-copied model with the same name and size.
-        if (out.exists() && size != null && out.length() == size) {
-            return out
-        }
+    private fun queryDisplayName(uri: Uri): String? {
+        val resolver = getApplication<Application>().contentResolver
         return try {
-            resolver.openInputStream(uri)?.use { input ->
-                FileOutputStream(out).use { output ->
-                    input.copyTo(output, DEFAULT_BUFFER_SIZE)
+            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) return@use c.getString(idx)
                 }
-            } ?: return null
-            out
+                null
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "copy failed", e)
             null
         }
     }
 
-    private fun queryDisplayName(uri: Uri): String? {
-        val resolver = getApplication<Application>().contentResolver
-        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-            if (c.moveToFirst()) {
-                val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (idx >= 0) return c.getString(idx)
-            }
-        }
-        return null
-    }
-
-    private fun querySize(uri: Uri): Long? {
-        val resolver = getApplication<Application>().contentResolver
-        resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
-            if (c.moveToFirst()) {
-                val idx = c.getColumnIndex(OpenableColumns.SIZE)
-                if (idx >= 0 && !c.isNull(idx)) return c.getLong(idx)
-            }
-        }
-        return null
-    }
-
     private suspend fun setStatus(s: String) {
-        kotlinx.coroutines.withContext(Dispatchers.Main) { status = s }
+        withContext(Dispatchers.Main) { status = s }
     }
 
     private suspend fun setBusy(b: Boolean) {
-        kotlinx.coroutines.withContext(Dispatchers.Main) { busy = b }
+        withContext(Dispatchers.Main) { busy = b }
+    }
+
+    private fun closePfd() {
+        try {
+            modelPfd?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "closing descriptor failed", e)
+        }
+        modelPfd = null
     }
 
     private fun freeNative() {
@@ -218,6 +212,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             bridge.freeModel(modelPtr)
             modelPtr = 0L
         }
+        closePfd()
     }
 
     override fun onCleared() {
