@@ -21,13 +21,14 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK, NDK and CMake
         uses: android-actions/setup-android@v3
         with:
-          # Skip the default legacy "tools" package (removed from Google's SDK
-          # repo — installing it fails). AGP auto-downloads the platform and
-          # build-tools it needs during the build.
-          packages: ""
+          # Install exactly the NDK + CMake the native build needs. Specifying
+          # our own package list also avoids the action's default (and now
+          # broken) legacy "tools" package install. AGP auto-downloads the
+          # platform and build-tools during the build.
+          packages: "ndk;26.3.11579264 cmake;3.22.1"
 
       - name: Grant execute permission for gradlew
         run: chmod +x ./gradlew
