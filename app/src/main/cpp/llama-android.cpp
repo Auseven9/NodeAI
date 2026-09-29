@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <android/log.h>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -9,17 +10,16 @@
 #define LOGe(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 #define LOGi(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-static std::vector<llama_token> tokenize(const llama_model *model,
+static std::vector<llama_token> tokenize(const llama_vocab *vocab,
                                          const std::string &text,
                                          bool add_special) {
-    // First call with a null buffer to learn the token count.
-    int n = -llama_tokenize(model, text.c_str(), (int) text.size(),
+    int n = -llama_tokenize(vocab, text.c_str(), (int) text.size(),
                             nullptr, 0, add_special, true);
     if (n <= 0) {
         return {};
     }
     std::vector<llama_token> tokens(n);
-    int check = llama_tokenize(model, text.c_str(), (int) text.size(),
+    int check = llama_tokenize(vocab, text.c_str(), (int) text.size(),
                                tokens.data(), n, add_special, true);
     if (check < 0) {
         return {};
@@ -28,9 +28,9 @@ static std::vector<llama_token> tokenize(const llama_model *model,
     return tokens;
 }
 
-static std::string token_to_piece(const llama_model *model, llama_token token) {
+static std::string token_to_piece(const llama_vocab *vocab, llama_token token) {
     char buf[256];
-    int n = llama_token_to_piece(model, token, buf, sizeof(buf), 0, true);
+    int n = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, true);
     if (n < 0) {
         return {};
     }
@@ -54,7 +54,7 @@ Java_com_auseven_nodeai_LlamaBridge_loadModel(JNIEnv *env, jobject, jstring path
     const char *path = env->GetStringUTFChars(pathJ, nullptr);
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0; // CPU only
-    llama_model *model = llama_load_model_from_file(path, mparams);
+    llama_model *model = llama_model_load_from_file(path, mparams);
     env->ReleaseStringUTFChars(pathJ, path);
     if (model == nullptr) {
         LOGe("failed to load model");
@@ -66,7 +66,7 @@ Java_com_auseven_nodeai_LlamaBridge_loadModel(JNIEnv *env, jobject, jstring path
 JNIEXPORT void JNICALL
 Java_com_auseven_nodeai_LlamaBridge_freeModel(JNIEnv *, jobject, jlong modelPtr) {
     if (modelPtr != 0) {
-        llama_free_model(reinterpret_cast<llama_model *>(modelPtr));
+        llama_model_free(reinterpret_cast<llama_model *>(modelPtr));
     }
 }
 
@@ -79,7 +79,7 @@ Java_com_auseven_nodeai_LlamaBridge_newContext(JNIEnv *, jobject, jlong modelPtr
     cparams.n_batch = 512;
     cparams.n_threads = nThreads;
     cparams.n_threads_batch = nThreads;
-    llama_context *ctx = llama_new_context_with_model(model, cparams);
+    llama_context *ctx = llama_init_from_model(model, cparams);
     if (ctx == nullptr) {
         LOGe("failed to create context");
         return 0;
@@ -94,12 +94,73 @@ Java_com_auseven_nodeai_LlamaBridge_freeContext(JNIEnv *, jobject, jlong ctxPtr)
     }
 }
 
+// Formats the conversation using the model's embedded chat template (Gemma,
+// Phi, Qwen, ChatML, etc.). Falls back to returning null if none is available,
+// in which case the Kotlin side applies a generic template.
+JNIEXPORT jstring JNICALL
+Java_com_auseven_nodeai_LlamaBridge_applyChatTemplate(JNIEnv *env, jobject, jlong modelPtr,
+                                                      jobjectArray rolesJ, jobjectArray contentsJ,
+                                                      jboolean addAssistant) {
+    auto *model = reinterpret_cast<llama_model *>(modelPtr);
+    const char *tmpl = llama_model_chat_template(model, nullptr);
+    if (tmpl == nullptr) {
+        return nullptr;
+    }
+
+    jsize n = env->GetArrayLength(rolesJ);
+    std::vector<llama_chat_message> msgs;
+    std::vector<jstring> roleRefs, contentRefs;
+    std::vector<const char *> roleC, contentC;
+    msgs.reserve(n);
+
+    size_t estimate = 256;
+    for (jsize i = 0; i < n; i++) {
+        auto r = (jstring) env->GetObjectArrayElement(rolesJ, i);
+        auto c = (jstring) env->GetObjectArrayElement(contentsJ, i);
+        const char *rc = env->GetStringUTFChars(r, nullptr);
+        const char *cc = env->GetStringUTFChars(c, nullptr);
+        roleRefs.push_back(r);
+        contentRefs.push_back(c);
+        roleC.push_back(rc);
+        contentC.push_back(cc);
+        estimate += strlen(rc) + strlen(cc) + 16;
+        msgs.push_back(llama_chat_message{rc, cc});
+    }
+
+    std::vector<char> buf(estimate);
+    int32_t written = llama_chat_apply_template(tmpl, msgs.data(), (size_t) n,
+                                                addAssistant == JNI_TRUE,
+                                                buf.data(), (int32_t) buf.size());
+    if (written > (int32_t) buf.size()) {
+        buf.resize(written);
+        written = llama_chat_apply_template(tmpl, msgs.data(), (size_t) n,
+                                            addAssistant == JNI_TRUE,
+                                            buf.data(), (int32_t) buf.size());
+    }
+
+    // Release the pinned Java strings.
+    for (jsize i = 0; i < n; i++) {
+        env->ReleaseStringUTFChars(roleRefs[i], roleC[i]);
+        env->ReleaseStringUTFChars(contentRefs[i], contentC[i]);
+        env->DeleteLocalRef(roleRefs[i]);
+        env->DeleteLocalRef(contentRefs[i]);
+    }
+
+    if (written < 0) {
+        LOGe("llama_chat_apply_template failed");
+        return nullptr;
+    }
+    std::string out(buf.data(), written);
+    return env->NewStringUTF(out.c_str());
+}
+
 JNIEXPORT void JNICALL
 Java_com_auseven_nodeai_LlamaBridge_generate(JNIEnv *env, jobject, jlong modelPtr,
                                              jlong ctxPtr, jstring promptJ,
                                              jint nPredict, jobject callback) {
     auto *model = reinterpret_cast<llama_model *>(modelPtr);
     auto *ctx = reinterpret_cast<llama_context *>(ctxPtr);
+    const llama_vocab *vocab = llama_model_get_vocab(model);
 
     const char *promptC = env->GetStringUTFChars(promptJ, nullptr);
     std::string prompt(promptC);
@@ -112,16 +173,16 @@ Java_com_auseven_nodeai_LlamaBridge_generate(JNIEnv *env, jobject, jlong modelPt
         return;
     }
 
-    // Fresh decode each turn: clear the KV cache and re-feed the full prompt.
-    llama_kv_cache_clear(ctx);
+    // Fresh decode each turn: clear the KV memory and re-feed the full prompt.
+    llama_memory_clear(llama_get_memory(ctx), true);
 
-    std::vector<llama_token> tokens = tokenize(model, prompt, true);
+    std::vector<llama_token> tokens = tokenize(vocab, prompt, true);
     if (tokens.empty()) {
         LOGe("tokenize produced no tokens");
         return;
     }
 
-    const int n_ctx = llama_n_ctx(ctx);
+    const int n_ctx = (int) llama_n_ctx(ctx);
     if ((int) tokens.size() >= n_ctx) {
         LOGe("prompt too long: %d >= %d", (int) tokens.size(), n_ctx);
         return;
@@ -153,18 +214,17 @@ Java_com_auseven_nodeai_LlamaBridge_generate(JNIEnv *env, jobject, jlong modelPt
 
     while (n_decoded < nPredict) {
         llama_token new_token = llama_sampler_sample(smpl, ctx, -1);
-        if (llama_token_is_eog(model, new_token)) {
+        if (llama_vocab_is_eog(vocab, new_token)) {
             break;
         }
 
-        std::string piece = token_to_piece(model, new_token);
+        std::string piece = token_to_piece(vocab, new_token);
         if (!piece.empty()) {
             jstring js = env->NewStringUTF(piece.c_str());
             env->CallVoidMethod(callback, onToken, js);
             env->DeleteLocalRef(js);
         }
 
-        // Feed the sampled token back in as the next single-token batch.
         batch.n_tokens = 1;
         batch.token[0] = new_token;
         batch.pos[0] = n_cur;

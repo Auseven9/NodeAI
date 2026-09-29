@@ -23,7 +23,7 @@ set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     llama
     GIT_REPOSITORY https://github.com/ggerganov/llama.cpp
-    GIT_TAG b3901
+    GIT_TAG b11246
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(llama)

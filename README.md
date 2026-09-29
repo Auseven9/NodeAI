@@ -61,9 +61,11 @@ app/src/main/
 - **arm64-v8a only** — runs on physical phones, not the default x86_64 emulator.
 - **Greedy sampling** (deterministic). Temperature / top-p sampling isn't wired
   up yet.
-- **Prompt template** is ChatML (`<|im_start|>…`), which suits many modern
-  instruct models (e.g. Qwen). Models expecting a different template may format
-  oddly — using each model's embedded chat template is a natural next step.
+- **Chat template** uses each model's own embedded template (Gemma, Phi, Qwen,
+  ChatML, etc.), with a generic ChatML fallback if a model has none.
+- Requires a recent model architecture supported by the pinned llama.cpp build
+  (see `app/src/main/cpp/CMakeLists.txt`). Non-chat GGUFs (embedding models,
+  vision projectors) won't load as chat models.
 - Each turn re-feeds the full conversation (KV cache is cleared per turn) for
   simplicity, so very long chats get slower.
 
@@ -77,3 +79,4 @@ app/src/main/
 | Min SDK | 24 (Android 7.0) |
 | ABI | arm64-v8a |
 | Build | Gradle 8.14 + AGP 8.7, NDK r26 |
+| llama.cpp | tag `b11246` |

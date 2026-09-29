@@ -146,26 +146,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }.buffer().flowOn(Dispatchers.Default)
 
     /**
-     * Builds a ChatML-style prompt from the conversation so far. This matches
-     * many modern instruct GGUF models (Qwen, etc.). The final empty assistant
-     * message added in [send] is skipped.
+     * Builds the prompt from the conversation. Prefers the model's own embedded
+     * chat template (so Gemma, Phi, Qwen, etc. each format correctly); falls
+     * back to a generic ChatML layout if the model has none. The trailing empty
+     * assistant message added in [send] is excluded.
      */
     private fun buildPrompt(): String {
+        val history = messages.filter { !(it.role == Role.ASSISTANT && it.text.isEmpty()) }
+        val roles = history.map { if (it.role == Role.USER) "user" else "assistant" }.toTypedArray()
+        val contents = history.map { it.text }.toTypedArray()
+
+        val templated = try {
+            bridge.applyChatTemplate(modelPtr, roles, contents, true)
+        } catch (e: Exception) {
+            Log.e(TAG, "applyChatTemplate failed", e)
+            null
+        }
+        return templated ?: fallbackChatMl(history)
+    }
+
+    private fun fallbackChatMl(history: List<ChatMessage>): String {
         val sb = StringBuilder()
-        sb.append("<|im_start|>system\n")
-        sb.append("You are a helpful assistant.")
-        sb.append("<|im_end|>\n")
-        for (m in messages) {
-            when (m.role) {
-                Role.USER -> {
-                    sb.append("<|im_start|>user\n").append(m.text).append("<|im_end|>\n")
-                }
-                Role.ASSISTANT -> {
-                    if (m.text.isNotEmpty()) {
-                        sb.append("<|im_start|>assistant\n").append(m.text).append("<|im_end|>\n")
-                    }
-                }
-            }
+        for (m in history) {
+            val role = if (m.role == Role.USER) "user" else "assistant"
+            sb.append("<|im_start|>").append(role).append("\n")
+                .append(m.text).append("<|im_end|>\n")
         }
         sb.append("<|im_start|>assistant\n")
         return sb.toString()
